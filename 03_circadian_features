@@ -1,0 +1,133 @@
+"""
+03_circadian_features.py
+========================
+Circadian rhythm features from minute-level Fitbit step data
+(steps_intraday), computed within the pre-symptomatic window.
+
+Features
+--------
+Non-parametric (from hourly step profiles):
+    M10       - mean activity of the 10 most active hours
+    L5        - mean activity of the 5 least active hours
+    RA        - relative amplitude = (M10 - L5) / (M10 + L5)
+    M10_onset - onset hour of the most active 10-hour block
+    L5_onset  - onset hour of the least active 5-hour block
+    RA_sd     - day-to-day variability of RA (rhythm instability)
+
+Parametric (cosinor fit to the 24-hour profile):
+    mesor, amplitude, acrophase
+
+Adapted from the Sano Lab reference implementation to the All of Us CDR
+(hourly aggregation of steps_intraday via BigQuery).
+
+Findings (see README): the "rhythm-shape" features (RA, RA_sd, acrophase)
+are independent of daily step counts (|r| <= 0.27) and statistically
+associated with all four diseases, but add incremental predictive value
+only in schizophrenia; M10/mesor/amplitude are collinear with step counts.
+
+Requires All of Us Controlled Tier. No participant data included.
+"""
+
+import os
+import numpy as np
+import pandas as pd
+import pandas_gbq
+from scipy.optimize import curve_fit
+
+CDR = os.environ["WORKSPACE_CDR"]
+WINDOW_START_DAYS = 548
+WINDOW_END_DAYS = 180
+MIN_DAYS = 7
+MIN_DAILY_STEPS = 100  # skip near-zero (non-wear) days
+
+
+def fetch_hourly_steps(ids, index_dates):
+    """Aggregate minute-level steps to hourly, restricted to the window.
+
+    Aggregation is done server-side in BigQuery to keep the transfer small.
+    """
+    ids_str = ",".join(map(str, ids))
+    hourly = pandas_gbq.read_gbq(f"""
+        SELECT person_id,
+               DATE(datetime) AS date,
+               EXTRACT(HOUR FROM datetime) AS hour,
+               SUM(CAST(steps AS FLOAT64)) AS hourly_steps
+        FROM `{CDR}`.steps_intraday
+        WHERE person_id IN ({ids_str})
+        GROUP BY person_id, date, hour
+    """, dialect="standard")
+    hourly["date"] = pd.to_datetime(hourly["date"])
+    hourly = hourly.merge(index_dates, on="person_id")
+    hourly["index_date"] = pd.to_datetime(hourly["index_date"])
+    hourly["days_before"] = (hourly["index_date"] - hourly["date"]).dt.days
+    return hourly[(hourly["days_before"] >= WINDOW_END_DAYS) &
+                  (hourly["days_before"] <= WINDOW_START_DAYS)]
+
+
+def compute_m10_l5(steps_24):
+    """M10, L5, RA and their onsets from a 24-hour step profile."""
+    s = np.asarray(steps_24, dtype=float)
+    s2 = np.concatenate([s, s])  # wrap-around for contiguous windows
+    best_m10, onset_m10 = -np.inf, 0
+    worst_l5, onset_l5 = np.inf, 0
+    for h in range(24):
+        m = s2[h:h + 10].mean()
+        if m > best_m10:
+            best_m10, onset_m10 = m, h
+        l = s2[h:h + 5].mean()
+        if l < worst_l5:
+            worst_l5, onset_l5 = l, h
+    denom = best_m10 + worst_l5
+    ra = (best_m10 - worst_l5) / denom if denom > 0 else np.nan
+    return best_m10, onset_m10, worst_l5, onset_l5, ra
+
+
+def _cosinor(t, mesor, amplitude, acrophase):
+    return mesor + amplitude * np.cos(2 * np.pi * t / 24 - acrophase)
+
+
+def fit_cosinor(hours, steps):
+    """Fit a 24-hour cosinor; return (mesor, amplitude, acrophase)."""
+    t = np.asarray(hours, dtype=float)
+    y = np.asarray(steps, dtype=float)
+    if np.isnan(y).all() or len(t) < 4:
+        return np.nan, np.nan, np.nan
+    try:
+        p0 = [np.nanmean(y), (np.nanmax(y) - np.nanmin(y)) / 2, np.pi]
+        popt, _ = curve_fit(_cosinor, t, y, p0=p0, maxfev=2000)
+        mesor, amp, acro = popt
+        return mesor, abs(amp), acro % (2 * np.pi)
+    except Exception:
+        return np.nan, np.nan, np.nan
+
+
+def compute_circadian_features(hourly, min_days=MIN_DAYS):
+    """Per-day circadian metrics, aggregated to per-person means (+ RA_sd)."""
+    records = []
+    for (pid, date), grp in hourly.groupby(["person_id", "date"]):
+        profile = (pd.DataFrame({"hour": range(24)})
+                   .merge(grp[["hour", "hourly_steps"]], on="hour", how="left"))
+        steps_24 = profile["hourly_steps"].fillna(0).values
+        if steps_24.sum() < MIN_DAILY_STEPS:
+            continue
+        m10, m10_on, l5, l5_on, ra = compute_m10_l5(steps_24)
+        mesor, amp, acro = fit_cosinor(profile["hour"].values, steps_24)
+        records.append({"person_id": pid, "M10": m10, "M10_onset": m10_on,
+                        "L5": l5, "L5_onset": l5_on, "RA": ra, "mesor": mesor,
+                        "amplitude": amp, "acrophase": acro})
+    if not records:
+        return pd.DataFrame()
+    daily = pd.DataFrame(records)
+    agg = ["M10", "L5", "RA", "mesor", "amplitude", "acrophase", "M10_onset", "L5_onset"]
+    feat = daily.groupby("person_id").agg(
+        **{f"c_{c}": (c, "mean") for c in agg},
+        c_RA_sd=("RA", "std"),          # rhythm instability
+        n_circ_days=("RA", "count"),
+    ).reset_index()
+    return feat[feat["n_circ_days"] >= min_days]
+
+
+if __name__ == "__main__":
+    # steps_intraday is very large; process in batches of person_ids and
+    # save incrementally. Adopted only for the SCZ model (see paper).
+    pass

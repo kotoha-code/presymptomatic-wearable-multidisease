@@ -1,0 +1,159 @@
+"""
+02_feature_extraction.py
+========================
+Window-based feature extraction (wearable, survey, lab) for cases and
+matched controls, over the pre-symptomatic prediction window
+(548 to 180 days before the index date).
+
+Feature groups
+--------------
+- Wearable (Fitbit daily summaries): sleep duration & variability, sleep
+  stages (deep/light/REM), steps & variability, MVPA, sedentary time.
+- Demographic: age (at index date), sex, race, BMI.
+- Survey: smoking, alcohol, education (+ family history for T2D).
+- Lab (disease-specific): HbA1c (T2D), lipid panel (CAD).
+
+Time-invariant fields (age, sex, race, survey, labels) are taken from the
+participant table; only time-varying wearable/BMI features are recomputed
+within the window. Cases use the diagnosis date as the window anchor;
+controls use the borrowed index date from matching.
+
+Requires All of Us Controlled Tier. No participant data is included here.
+"""
+
+import os
+import pandas as pd
+import pandas_gbq
+
+CDR = os.environ["WORKSPACE_CDR"]
+
+WINDOW_START_DAYS = 548
+WINDOW_END_DAYS = 180
+MIN_NIGHTS = 7        # minimum wearable nights/days in window
+BMI_CONCEPT_ID = 3038553
+BMI_RANGE = (10, 80)  # plausibility filter
+
+LAB_CONFIG = {
+    # name        : (measurement_concept_id, min, max)
+    "hba1c":      (3004410, 3, 20),
+    "total_chol": (3027114, 50, 500),
+    "ldl":        (3028288, 20, 400),
+    "hdl":        (3007070, 10, 200),
+    "triglyc":    (3022192, 20, 2000),
+}
+DISEASE_LABS = {"T2D": ["hba1c"], "CAD": ["total_chol", "ldl", "hdl", "triglyc"]}
+
+
+def _window_bounds(df, anchor_col):
+    """Add w_start / w_end columns for the prediction window."""
+    df = df.copy()
+    df[anchor_col] = pd.to_datetime(df[anchor_col])
+    df["w_start"] = df[anchor_col] - pd.Timedelta(days=WINDOW_START_DAYS)
+    df["w_end"] = df[anchor_col] - pd.Timedelta(days=WINDOW_END_DAYS)
+    return df
+
+
+def compute_sleep_features(subjects, anchor_col):
+    """Mean/SD sleep duration and stage means within the window."""
+    s = _window_bounds(subjects, anchor_col)
+    pids = ",".join(s["person_id"].astype(int).astype(str))
+    sleep = pandas_gbq.read_gbq(f"""
+        SELECT person_id, sleep_date, minute_asleep,
+               minute_deep, minute_light, minute_rem
+        FROM `{CDR}`.sleep_daily_summary
+        WHERE is_main_sleep = 'true' AND person_id IN ({pids})
+    """, dialect="standard")
+    sleep["sleep_date"] = pd.to_datetime(sleep["sleep_date"])
+    sleep = sleep.merge(s[["person_id", "w_start", "w_end"]], on="person_id")
+    sleep = sleep[(sleep["sleep_date"] >= sleep["w_start"]) &
+                  (sleep["sleep_date"] < sleep["w_end"])]
+    feat = sleep.groupby("person_id").agg(
+        w_mean_sleep=("minute_asleep", lambda x: x.mean() / 60),
+        w_sd_sleep=("minute_asleep", lambda x: x.std() / 60),  # sleep irregularity
+        w_mean_deep=("minute_deep", "mean"),
+        w_mean_light=("minute_light", "mean"),
+        w_mean_rem=("minute_rem", "mean"),
+        w_n_nights=("minute_asleep", "size"),
+    ).reset_index()
+    return feat[feat["w_n_nights"] >= MIN_NIGHTS]
+
+
+def compute_activity_features(subjects, anchor_col):
+    """Mean/SD steps, MVPA, sedentary within the window."""
+    s = _window_bounds(subjects, anchor_col)
+    pids = ",".join(s["person_id"].astype(int).astype(str))
+    act = pandas_gbq.read_gbq(f"""
+        SELECT person_id, date, steps,
+               fairly_active_minutes, very_active_minutes, sedentary_minutes
+        FROM `{CDR}`.activity_summary
+        WHERE person_id IN ({pids})
+    """, dialect="standard")
+    act["date"] = pd.to_datetime(act["date"])
+    act = act.merge(s[["person_id", "w_start", "w_end"]], on="person_id")
+    act = act[(act["date"] >= act["w_start"]) & (act["date"] < act["w_end"])]
+    act["mvpa"] = act["fairly_active_minutes"] + act["very_active_minutes"]
+    feat = act.groupby("person_id").agg(
+        w_mean_steps=("steps", "mean"),
+        w_sd_steps=("steps", "std"),
+        w_mean_mvpa=("mvpa", "mean"),
+        w_mean_sedentary=("sedentary_minutes", "mean"),
+        w_n_step_days=("steps", "size"),
+    ).reset_index()
+    return feat[feat["w_n_step_days"] >= MIN_NIGHTS]
+
+
+def compute_bmi(subjects, anchor_col):
+    """Mean BMI within the window (plausibility-filtered)."""
+    s = _window_bounds(subjects, anchor_col)
+    pids = ",".join(s["person_id"].astype(int).astype(str))
+    bmi = pandas_gbq.read_gbq(f"""
+        SELECT person_id, measurement_date, value_as_number
+        FROM `{CDR}`.measurement
+        WHERE measurement_concept_id = {BMI_CONCEPT_ID} AND person_id IN ({pids})
+    """, dialect="standard")
+    bmi["measurement_date"] = pd.to_datetime(bmi["measurement_date"])
+    bmi = bmi.merge(s[["person_id", "w_start", "w_end"]], on="person_id")
+    bmi = bmi[(bmi["measurement_date"] >= bmi["w_start"]) &
+              (bmi["measurement_date"] < bmi["w_end"])]
+    bmi = bmi[(bmi["value_as_number"] >= BMI_RANGE[0]) &
+              (bmi["value_as_number"] <= BMI_RANGE[1])]
+    return bmi.groupby("person_id").agg(w_bmi=("value_as_number", "mean")).reset_index()
+
+
+def compute_lab(subjects, anchor_col, lab_name):
+    """Mean lab value within the window (disease-specific).
+
+    Note: HbA1c is treated as *exploratory* (a diagnosis proxy: case values
+    sit close to the diagnostic threshold), not a genuine pre-symptomatic
+    signal. See the paper/README.
+    """
+    concept_id, vmin, vmax = LAB_CONFIG[lab_name]
+    s = _window_bounds(subjects, anchor_col)
+    pids = ",".join(s["person_id"].astype(int).astype(str))
+    lab = pandas_gbq.read_gbq(f"""
+        SELECT person_id, measurement_date, value_as_number
+        FROM `{CDR}`.measurement
+        WHERE measurement_concept_id = {concept_id} AND person_id IN ({pids})
+    """, dialect="standard")
+    lab["measurement_date"] = pd.to_datetime(lab["measurement_date"])
+    lab = lab.merge(s[["person_id", "w_start", "w_end"]], on="person_id")
+    lab = lab[(lab["measurement_date"] >= lab["w_start"]) &
+              (lab["measurement_date"] < lab["w_end"])]
+    lab = lab[(lab["value_as_number"] >= vmin) & (lab["value_as_number"] <= vmax)]
+    return lab.groupby("person_id").agg(
+        **{f"lab_{lab_name}": ("value_as_number", "mean")}
+    ).reset_index()
+
+
+def build_feature_table(subjects, anchor_col):
+    """Merge sleep + activity + BMI into one per-person feature table."""
+    sl = compute_sleep_features(subjects, anchor_col)
+    ac = compute_activity_features(subjects, anchor_col)
+    bm = compute_bmi(subjects, anchor_col)
+    return sl.merge(ac, on="person_id", how="outer").merge(bm, on="person_id", how="left")
+
+
+if __name__ == "__main__":
+    # Cases: anchor on the diagnosis date; controls: anchor on the borrowed
+    # index date (from 01_cohort_matching.py).
+    pass

@@ -50,8 +50,8 @@ CONCEPT_IDS = {
 }
 
 # Prediction window (days before diagnosis / index date)
-WINDOW_START_DAYS = 548  # 18 months
-WINDOW_END_DAYS = 180    # 6 months
+WINDOW_START_DAYS = 548  # ~18 months before diagnosis
+WINDOW_END_DAYS = 180    # ~6 months before diagnosis (exclusion buffer)
 
 MATCH_RATIO = 4          # controls per case
 AGE_TOLERANCE = 5        # years

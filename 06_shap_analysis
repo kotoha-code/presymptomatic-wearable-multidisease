@@ -1,0 +1,73 @@
+"""
+06_shap_analysis.py
+===================
+SHAP feature-contribution analysis for the final per-disease models.
+
+- Tree models (RF / HistGBT): shap.TreeExplainer (fast, exact).
+- TabPFN: shap.KernelExplainer with a k-means background summary and a
+  capped set of explained samples (KernelExplainer is model-agnostic but
+  slow; used for the SCZ TabPFN model).
+
+For small cohorts (e.g. SCZ, n=101) a single train/test split gives an
+unstable, misleading attribution; prefer cross-validated SHAP (compute
+per fold and average).
+
+Requires All of Us Controlled Tier. No participant data included.
+"""
+
+import numpy as np
+import pandas as pd
+import shap
+from sklearn.model_selection import StratifiedKFold, train_test_split
+
+
+def tree_shap_importance(pipeline_pre, tree_model, X_train, X_test, feature_names):
+    """Mean |SHAP| importance for a fitted tree model on preprocessed data."""
+    explainer = shap.TreeExplainer(tree_model)
+    shap_values = explainer.shap_values(X_test)
+    return pd.DataFrame({
+        "feature": feature_names,
+        "mean_abs_shap": np.abs(shap_values).mean(axis=0),
+    }).sort_values("mean_abs_shap", ascending=False)
+
+
+def cv_tree_shap(estimator_factory, X, y, feature_names, n_splits=5):
+    """Cross-validated SHAP importance (average of per-fold mean |SHAP|).
+
+    Recommended for small cohorts to avoid single-split artifacts.
+    `estimator_factory()` returns a fresh (unfitted) tree model.
+    """
+    cv = StratifiedKFold(n_splits, shuffle=True, random_state=42)
+    per_fold = []
+    for tr, te in cv.split(X, y):
+        model = estimator_factory()
+        model.fit(X[tr], y[tr])
+        sv = shap.TreeExplainer(model).shap_values(X[te])
+        per_fold.append(np.abs(sv).mean(axis=0))
+    imp = np.array(per_fold)
+    return pd.DataFrame({
+        "feature": feature_names,
+        "mean_abs_shap": imp.mean(axis=0),
+        "sd": imp.std(axis=0),
+    }).sort_values("mean_abs_shap", ascending=False)
+
+
+def kernel_shap_importance(predict_proba_fn, X_train, X_test, feature_names,
+                           n_background=80, n_explain=150, nsamples=200):
+    """Model-agnostic SHAP (e.g. for TabPFN). Background/explained sets are
+    subsampled because KernelExplainer is expensive."""
+    background = shap.kmeans(X_train, min(n_background, X_train.shape[0]))
+    X_exp = X_test[:min(n_explain, X_test.shape[0])]
+    explainer = shap.KernelExplainer(predict_proba_fn, background)
+    shap_values = explainer.shap_values(X_exp, nsamples=nsamples)
+    return pd.DataFrame({
+        "feature": feature_names,
+        "mean_abs_shap": np.abs(shap_values).mean(axis=0),
+    }).sort_values("mean_abs_shap", ascending=False)
+
+
+if __name__ == "__main__":
+    # Build the final feature matrix per disease (05), fit the best model,
+    # and compute SHAP importances (tree models via cv_tree_shap; SCZ TabPFN
+    # via kernel_shap_importance).
+    pass

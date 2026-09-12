@@ -1,0 +1,182 @@
+"""
+05_machine_learning.py
+======================
+Multimodal machine-learning pipeline with modality ablation.
+
+Design
+------
+- Models: Logistic Regression, Random Forest, Gradient Boosting (HistGBT),
+  TabPFN. All class-balanced.
+- Evaluation: stratified 5-fold cross-validation. Imputation, scaling and
+  one-hot encoding are fit *inside each fold* (leakage prevention) via a
+  scikit-learn Pipeline + ColumnTransformer.
+- Age is normalized to integer years to remove an artifactual case/control
+  separation (cases had integer ages, controls fractional).
+- Metrics: AUROC and AUPRC (baseline = prevalence ~0.24).
+- Modality ablation: demographic -> +wearable -> +survey -> +disease-specific.
+
+Disease-specific features:
+    T2D  : HbA1c* + family history   (*diagnosis proxy, exploratory)
+    SCZ  : circadian rhythm-shape (RA, RA_sd, acrophase, onsets)
+    CAD  : lipid panel
+    DEPR : none
+
+Requires All of Us Controlled Tier. No participant data included.
+"""
+
+import os
+import numpy as np
+import pandas as pd
+import scipy.sparse as sp
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler, OneHotEncoder, FunctionTransformer
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.model_selection import StratifiedKFold, cross_validate
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier, HistGradientBoostingClassifier
+
+# Feature groups
+WEARABLE = ["w_mean_sleep", "w_sd_sleep", "w_mean_deep", "w_mean_light", "w_mean_rem",
+            "w_mean_steps", "w_sd_steps", "w_mean_mvpa", "w_mean_sedentary"]
+CIRCADIAN = ["c_RA", "c_RA_sd", "c_acrophase", "c_M10_onset", "c_L5_onset"]
+DEMO_NUM = ["age", "w_bmi"]
+DEMO_CAT = ["gender_concept_id", "race_concept_id"]
+SURVEY_CAT = ["smoking", "alcohol_freq", "education_group"]
+
+DISEASE_SPECIFIC_NUM = {
+    "T2D": ["lab_hba1c"],
+    "CAD": ["lab_total_chol", "lab_ldl", "lab_hdl", "lab_triglyc"],
+    "SCZ": CIRCADIAN,          # adopted for SCZ only
+    "DEPR": [],
+}
+DISEASE_SPECIFIC_CAT = {"T2D": ["t2d_family_history"], "CAD": [], "SCZ": [], "DEPR": []}
+
+
+def _to_dense(X):
+    return X.toarray() if sp.issparse(X) else X
+
+
+def make_pipeline(num_cols, cat_cols, model):
+    """Preprocessing (fit within fold) + model."""
+    pre = ColumnTransformer([
+        ("num", Pipeline([("imp", SimpleImputer(strategy="median")),
+                          ("sc", StandardScaler())]), num_cols),
+        ("cat", Pipeline([("imp", SimpleImputer(strategy="most_frequent")),
+                          ("oh", OneHotEncoder(handle_unknown="ignore",
+                                               sparse_output=False))]), cat_cols),
+    ], sparse_threshold=0)
+    return Pipeline([("pre", pre),
+                     ("dense", FunctionTransformer(_to_dense)),
+                     ("model", model)])
+
+
+def get_models():
+    """The four classifiers (class-balanced; RF/GBT lightly regularized)."""
+    models = [
+        ("LR", LogisticRegression(max_iter=2000, class_weight="balanced")),
+        ("RF", RandomForestClassifier(n_estimators=500, max_depth=8,
+                                      min_samples_leaf=10, class_weight="balanced",
+                                      random_state=42, n_jobs=-1)),
+        ("GB", HistGradientBoostingClassifier(learning_rate=0.05, max_iter=300,
+                                              max_depth=4, l2_regularization=1.0,
+                                              early_stopping=True, random_state=42,
+                                              class_weight="balanced")),
+    ]
+    try:
+        from tabpfn import TabPFNClassifier
+        os.environ.setdefault("TABPFN_ALLOW_CPU_LARGE_DATASET", "1")
+        models.append(("TabPFN", TabPFNClassifier(device="cpu",
+                                                  ignore_pretraining_limits=True)))
+    except ImportError:
+        pass  # TabPFN optional (needs a license/API key; slow on CPU for
+              # large cohorts and for KernelExplainer SHAP)
+    return models
+
+
+def build_data(disease, case_features, control_features, master,
+               matched_controls, lab_tables=None):
+    """Assemble the per-disease modelling table.
+
+    Merges case/control wearable(+circadian) features with demographic and
+    survey fields from `master`, computes integer age at the index date
+    (leakage control), and joins disease-specific labs.
+
+    Parameters
+    ----------
+    case_features, control_features : pd.DataFrame
+        Per-person feature tables (from 02/03), with a person_id column.
+    master : pd.DataFrame
+        Participant table (labels, birth_datetime, demographics, survey).
+    matched_controls : pd.DataFrame
+        Output of 01 (person_id, index_date, matched_case).
+    lab_tables : dict[str, pd.DataFrame] | None
+        Optional per-lab tables to merge (disease-specific).
+
+    Returns
+    -------
+    pd.DataFrame with a 'label' column (1=case, 0=control).
+    """
+    date_col = f"{disease}_date"
+    case = case_features.copy(); case["label"] = 1
+    ctrl = control_features.copy(); ctrl["label"] = 0
+    data = pd.concat([case, ctrl], ignore_index=True)
+
+    # demographic + survey from master
+    demo = master[["person_id", "gender_concept_id", "race_concept_id",
+                   "smoking", "alcohol_freq", "education_group",
+                   "t2d_family_history", "birth_datetime"]]
+    data = data.merge(demo, on="person_id", how="left")
+
+    # index date: case = diagnosis date; control = borrowed index date
+    idx = matched_controls[["person_id", "index_date"]].drop_duplicates("person_id")
+    data = data.merge(idx, on="person_id", how="left")
+    case_dates = master[["person_id", date_col]].rename(columns={date_col: "case_date"})
+    data = data.merge(case_dates, on="person_id", how="left")
+    anchor = pd.to_datetime(data["index_date"].fillna(data["case_date"]))
+
+    # integer age at index date (removes an artifactual case/control split)
+    data["age"] = np.floor(
+        (anchor - pd.to_datetime(data["birth_datetime"])).dt.days / 365.25
+    )
+
+    # disease-specific labs
+    if lab_tables:
+        for lab_df in lab_tables.values():
+            data = data.merge(lab_df, on="person_id", how="left")
+    return data
+
+
+def run_ablation(data, disease):
+    """Modality ablation with stratified 5-fold CV; returns AUROC/AUPRC +- SD."""
+    y = data["label"]
+    ds_num = [c for c in DISEASE_SPECIFIC_NUM[disease] if c in data.columns]
+    ds_cat = [c for c in DISEASE_SPECIFIC_CAT[disease] if c in data.columns]
+    steps = {
+        "demographic": (DEMO_NUM, DEMO_CAT),
+        "+wearable":   (DEMO_NUM + WEARABLE, DEMO_CAT),
+        "+survey":     (DEMO_NUM + WEARABLE, DEMO_CAT + SURVEY_CAT),
+    }
+    if ds_num or ds_cat:
+        steps["+disease-specific"] = (DEMO_NUM + WEARABLE + ds_num,
+                                      DEMO_CAT + SURVEY_CAT + ds_cat)
+    cv = StratifiedKFold(5, shuffle=True, random_state=42)
+    rows = []
+    for step, (num, cat) in steps.items():
+        for name, model in get_models():
+            r = cross_validate(make_pipeline(num, cat, model), data[num + cat], y,
+                               cv=cv, scoring=["roc_auc", "average_precision"])
+            rows.append({
+                "disease": disease, "step": step, "model": name,
+                "n_features": len(num) + len(cat),
+                "AUROC": r["test_roc_auc"].mean(), "AUROC_sd": r["test_roc_auc"].std(),
+                "AUPRC": r["test_average_precision"].mean(),
+                "AUPRC_sd": r["test_average_precision"].std(),
+            })
+    return pd.DataFrame(rows)
+
+
+if __name__ == "__main__":
+    # For each disease: build the merged case/control feature table,
+    # compute integer age at index date, then run_ablation().
+    pass

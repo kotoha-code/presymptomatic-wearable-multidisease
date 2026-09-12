@@ -1,0 +1,93 @@
+"""
+04_statistical_tests.py
+=======================
+Univariate screening of features (case vs. matched control) per disease.
+
+Method
+------
+- Mann-Whitney U test (non-parametric; the wearable distributions are
+  right-skewed).
+- rank-biserial correlation as the effect size.
+- Bonferroni correction across the tested features.
+- Interpretation is driven by effect size, not p-value, because large n
+  makes p-values trivially small.
+
+Important: cases are restricted to *matched* cases so that cases and
+controls come from the same matched population (an early version compared
+all cases to matched controls, which is an unfair, asymmetric comparison).
+
+Requires All of Us Controlled Tier. No participant data included.
+"""
+
+import numpy as np
+import pandas as pd
+from scipy.stats import mannwhitneyu, chi2_contingency
+
+COMMON_FEATURES = [
+    "w_mean_sleep", "w_sd_sleep", "w_mean_deep", "w_mean_light", "w_mean_rem",
+    "w_mean_steps", "w_sd_steps", "w_mean_mvpa", "w_mean_sedentary", "w_bmi",
+]
+
+
+def rank_biserial(u_stat, n1, n2):
+    """Effect size for Mann-Whitney U (range -1..1)."""
+    return 1 - (2 * u_stat) / (n1 * n2)
+
+
+def test_continuous(case_df, ctrl_df, features, disease):
+    """Mann-Whitney U + rank-biserial + Bonferroni for continuous features."""
+    rows = []
+    for col in features:
+        a = case_df[col].dropna()
+        b = ctrl_df[col].dropna()
+        if len(a) < 3 or len(b) < 3:
+            continue
+        u, p = mannwhitneyu(a, b, alternative="two-sided")
+        rows.append({
+            "feature": col,
+            "case_median": a.median(),
+            "ctrl_median": b.median(),
+            "p_value": p,
+            "effect_size": rank_biserial(u, len(a), len(b)),
+            "n_case": len(a), "n_ctrl": len(b),
+        })
+    df = pd.DataFrame(rows)
+    df["p_bonferroni"] = (df["p_value"] * len(df)).clip(upper=1.0)
+    df["significant"] = df["p_bonferroni"] < 0.05
+    df["disease"] = disease
+    return df
+
+
+def test_categorical(case_ids, ctrl_ids, master, variables, disease):
+    """Chi-square + Cramer's V for categorical survey variables."""
+    rows = []
+    for var in variables:
+        cvals = master[master["person_id"].isin(case_ids)][var].dropna()
+        tvals = master[master["person_id"].isin(ctrl_ids)][var].dropna()
+        table = pd.DataFrame({
+            "case": cvals.value_counts(),
+            "control": tvals.value_counts(),
+        }).fillna(0)
+        if table.shape[0] < 2:
+            continue
+        # Chi-square is used because all expected cell counts were >= 5 in
+        # this cohort (verified); Fisher's exact test was not required.
+        chi2, p, dof, expected = chi2_contingency(table)
+        n = table.values.sum()
+        cramers_v = np.sqrt(chi2 / (n * (min(table.shape) - 1)))
+        rows.append({
+            "disease": disease, "variable": var,
+            "p_value": p, "cramers_v": cramers_v,
+            "n_case": int(cvals.shape[0]), "n_ctrl": int(tvals.shape[0]),
+        })
+    df = pd.DataFrame(rows)
+    df["p_bonferroni"] = (df["p_value"] * len(df)).clip(upper=1.0)
+    df["significant"] = df["p_bonferroni"] < 0.05
+    return df
+
+
+if __name__ == "__main__":
+    # Build per-disease case/control feature tables (02_feature_extraction.py),
+    # restrict cases to matched cases, then run test_continuous /
+    # test_categorical and assemble the disease x feature effect-size map.
+    pass
